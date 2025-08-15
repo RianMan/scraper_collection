@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-上海A股成交量异常检测完整工作流
+上海A股成交量异常检测完整工作流 - 带图表生成版本
 基于阈值突破法，找出长期低量后突然放量的短线机会
+修复了字符串除法的类型错误问题
+新增：为异常股票自动生成成交量柱状图
 """
 
 import requests
@@ -16,6 +18,14 @@ import statistics
 from datetime import datetime
 import concurrent.futures
 import threading
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.font_manager import FontProperties
+import os
+
+# 配置中文字体
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
 
 # 配置日志
 logging.basicConfig(
@@ -58,6 +68,52 @@ class VolumeAnomalyWorkflow:
         
         # 线程锁
         self.lock = threading.Lock()
+        
+        # 图表存储目录
+        self.chart_dir = "volume_charts"
+        if not os.path.exists(self.chart_dir):
+            os.makedirs(self.chart_dir)
+    
+    def _safe_float_division(self, value, divisor, default=0.0):
+        """安全的浮点数除法，处理字符串和异常值"""
+        try:
+            if value is None:
+                return default
+            
+            # 如果是字符串，尝试转换为数字
+            if isinstance(value, str):
+                # 处理常见的非数字字符串
+                if value in ['--', 'N/A', '', 'null', 'undefined']:
+                    return default
+                # 尝试转换为浮点数
+                value = float(value)
+            
+            # 确保除数不为0
+            if divisor == 0:
+                return default
+                
+            return float(value) / float(divisor)
+            
+        except (ValueError, TypeError, ZeroDivisionError) as e:
+            logger.debug(f"数值转换失败: {value} / {divisor}, 错误: {str(e)}")
+            return default
+    
+    def _safe_float_conversion(self, value, default=0.0):
+        """安全的浮点数转换"""
+        try:
+            if value is None:
+                return default
+                
+            if isinstance(value, str):
+                if value in ['--', 'N/A', '', 'null', 'undefined']:
+                    return default
+                return float(value)
+                
+            return float(value)
+            
+        except (ValueError, TypeError) as e:
+            logger.debug(f"数值转换失败: {value}, 错误: {str(e)}")
+            return default
     
     def _get_random_user_agent(self):
         """获取随机User-Agent"""
@@ -179,23 +235,30 @@ class VolumeAnomalyWorkflow:
                     stocks = data.get('data', {}).get('diff', [])
                     
                     for stock in stocks:
-                        stock_code = stock.get('f12', '')
-                        stock_name = stock.get('f14', '')
-                        current_price = stock.get('f2', 0) / 100 if stock.get('f2') else 0
-                        change_pct = stock.get('f3', 0) / 100 if stock.get('f3') else 0
-                        volume = stock.get('f5', 0)
-                        turnover = stock.get('f6', 0)
-                        
-                        if stock_code and stock_name:
-                            stock_info = {
-                                'code': stock_code,
-                                'name': stock_name,
-                                'current_price': current_price,
-                                'change_pct': change_pct,
-                                'today_volume': volume / 100,  # 转换为万手
-                                'turnover': turnover
-                            }
-                            all_stocks.append(stock_info)
+                        try:
+                            stock_code = stock.get('f12', '')
+                            stock_name = stock.get('f14', '')
+                            
+                            # 使用安全的数值转换
+                            current_price = self._safe_float_division(stock.get('f2', 0), 100, 0.0)
+                            change_pct = self._safe_float_division(stock.get('f3', 0), 100, 0.0)
+                            volume = self._safe_float_conversion(stock.get('f5', 0), 0.0)
+                            turnover = self._safe_float_conversion(stock.get('f6', 0), 0.0)
+                            
+                            if stock_code and stock_name:
+                                stock_info = {
+                                    'code': stock_code,
+                                    'name': stock_name,
+                                    'current_price': current_price,
+                                    'change_pct': change_pct,
+                                    'today_volume': volume / 100,  # 转换为万手
+                                    'turnover': turnover
+                                }
+                                all_stocks.append(stock_info)
+                                
+                        except Exception as e:
+                            logger.debug(f"处理股票数据失败: {str(e)}, 股票数据: {stock}")
+                            continue
                     
                     time.sleep(0.05)  # 短暂延迟
                     
@@ -245,12 +308,13 @@ class VolumeAnomalyWorkflow:
                 if len(parts) >= 6:
                     try:
                         date = parts[0]
-                        volume = float(parts[5]) / 100  # 转换为万手
+                        volume = self._safe_float_division(parts[5], 100, 0.0)  # 安全转换为万手
                         parsed_data.append({
                             'date': date,
                             'volume': volume
                         })
-                    except (ValueError, IndexError):
+                    except (ValueError, IndexError) as e:
+                        logger.debug(f"解析K线数据失败: {str(e)}, 数据: {parts}")
                         continue
             
             return parsed_data
@@ -258,6 +322,108 @@ class VolumeAnomalyWorkflow:
         except Exception as e:
             logger.debug(f"获取股票 {stock_code} K线数据失败: {str(e)}")
             return []
+    
+    def generate_volume_chart(self, stock_info, kline_data):
+        """为单只股票生成成交量柱状图"""
+        try:
+            stock_code = stock_info['code']
+            stock_name = stock_info['name']
+            
+            # 获取最近30天数据
+            recent_30 = kline_data[-31:]  # 包括今天
+            if len(recent_30) < 30:
+                logger.warning(f"股票 {stock_code} 数据不足30天，跳过图表生成")
+                return None
+            
+            # 准备数据
+            dates = [datetime.strptime(d['date'], '%Y-%m-%d') for d in recent_30]
+            volumes = [d['volume'] for d in recent_30]
+            
+            # 计算阈值线
+            today_volume = volumes[-1]
+            strict_threshold = today_volume * self.strict_threshold
+            loose_threshold = today_volume * self.loose_threshold
+            avg_volume = sum(volumes[:-1]) / len(volumes[:-1])  # 前29天平均值
+            
+            # 创建图表
+            fig, ax = plt.subplots(figsize=(12, 6))
+            
+            # 绘制成交量柱状图
+            colors = []
+            for i, vol in enumerate(volumes):
+                if i == len(volumes) - 1:  # 今天
+                    colors.append('#FF4444')  # 红色突出今天
+                elif vol > strict_threshold:
+                    colors.append('#FF8888')  # 浅红色表示超过严格阈值
+                elif vol > avg_volume:
+                    colors.append('#88BB88')  # 绿色表示高于平均
+                else:
+                    colors.append('#BBBBBB')  # 灰色表示正常
+            
+            bars = ax.bar(dates, volumes, color=colors, alpha=0.8, width=0.8)
+            
+            # 添加阈值线
+            ax.axhline(y=strict_threshold, color='red', linestyle='--', alpha=0.7, 
+                      label=f'严格阈值 ({strict_threshold:.1f}万手)')
+            ax.axhline(y=loose_threshold, color='orange', linestyle='--', alpha=0.7,
+                      label=f'宽松阈值 ({loose_threshold:.1f}万手)')
+            ax.axhline(y=avg_volume, color='blue', linestyle='-', alpha=0.5,
+                      label=f'29天均量 ({avg_volume:.1f}万手)')
+            
+            # 设置标题和标签
+            title = f"{stock_name}({stock_code}) 最近30天成交量走势\n"
+            title += f"当前价格: {stock_info['current_price']:.2f}元 | "
+            title += f"涨跌幅: {stock_info['change_pct']:+.2f}% | "
+            title += f"异常评分: {stock_info['anomaly_score']:.1f}"
+            
+            ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
+            ax.set_xlabel('日期', fontsize=12)
+            ax.set_ylabel('成交量 (万手)', fontsize=12)
+            
+            # 格式化X轴日期
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+            ax.xaxis.set_major_locator(mdates.DayLocator(interval=5))
+            plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
+            
+            # 添加网格
+            ax.grid(True, alpha=0.3)
+            
+            # 添加图例
+            ax.legend(loc='upper left')
+            
+            # 在今天的柱子上添加数值标注
+            today_bar = bars[-1]
+            height = today_bar.get_height()
+            ax.text(today_bar.get_x() + today_bar.get_width()/2., height + max(volumes)*0.02,
+                   f'{height:.1f}',
+                   ha='center', va='bottom', fontweight='bold', fontsize=10)
+            
+            # 添加突破标注
+            anomaly_types = stock_info['anomaly_type'].split(',')
+            annotation_text = "突破类型: " + ", ".join(anomaly_types)
+            if stock_info['is_historical_high']:
+                annotation_text += "\n🔥 创60天新高！"
+            
+            ax.text(0.02, 0.98, annotation_text, transform=ax.transAxes,
+                   fontsize=10, verticalalignment='top',
+                   bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.8))
+            
+            # 调整布局
+            plt.tight_layout()
+            
+            # 保存图表
+            filename = f"{self.chart_dir}/{stock_code}_{stock_name}_成交量异常.png"
+            # 处理文件名中的特殊字符
+            filename = filename.replace('/', '_').replace('\\', '_').replace('*', '_')
+            plt.savefig(filename, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            logger.info(f"📊 已生成图表: {filename}")
+            return filename
+            
+        except Exception as e:
+            logger.error(f"生成股票 {stock_info.get('code', 'unknown')} 图表失败: {str(e)}")
+            return None
     
     def analyze_volume_anomaly(self, stock_info):
         """分析单只股票的成交量异常"""
@@ -357,7 +523,8 @@ class VolumeAnomalyWorkflow:
                     'anomaly_score': anomaly_score,
                     'anomaly_type': ','.join(anomaly_type),
                     'turnover': stock_info['turnover'],
-                    'is_historical_high': today_volume > historical_max
+                    'is_historical_high': today_volume > historical_max,
+                    'kline_data': kline_data  # 保存K线数据用于生成图表
                 }
                 
                 return anomaly_info
@@ -429,6 +596,38 @@ class VolumeAnomalyWorkflow:
         except Exception as e:
             logger.error(f"检测成交量异常失败: {str(e)}")
     
+    def generate_all_charts(self):
+        """为所有异常股票生成图表"""
+        try:
+            if not self.anomaly_stocks:
+                logger.info("没有异常股票，跳过图表生成")
+                return
+            
+            logger.info(f"📊 开始为 {len(self.anomaly_stocks)} 只异常股票生成成交量图表...")
+            
+            chart_files = []
+            for i, stock in enumerate(self.anomaly_stocks, 1):
+                try:
+                    logger.info(f"📈 生成图表 {i}/{len(self.anomaly_stocks)}: {stock['name']}({stock['code']})")
+                    
+                    chart_file = self.generate_volume_chart(stock, stock['kline_data'])
+                    if chart_file:
+                        chart_files.append(chart_file)
+                        
+                    # 清理K线数据，节省内存
+                    del stock['kline_data']
+                    
+                except Exception as e:
+                    logger.error(f"生成股票 {stock['code']} 图表失败: {str(e)}")
+                    continue
+            
+            logger.info(f"✅ 成功生成 {len(chart_files)} 个图表，保存在 {self.chart_dir} 目录")
+            return chart_files
+            
+        except Exception as e:
+            logger.error(f"生成图表失败: {str(e)}")
+            return []
+    
     def save_results(self, filename=None):
         """保存检测结果"""
         try:
@@ -440,8 +639,16 @@ class VolumeAnomalyWorkflow:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 filename = f"成交量异常股票_{timestamp}.xlsx"
             
+            # 创建DataFrame前先清理K线数据
+            clean_stocks = []
+            for stock in self.anomaly_stocks:
+                clean_stock = stock.copy()
+                if 'kline_data' in clean_stock:
+                    del clean_stock['kline_data']  # 移除K线数据，Excel不需要
+                clean_stocks.append(clean_stock)
+            
             # 创建DataFrame
-            df = pd.DataFrame(self.anomaly_stocks)
+            df = pd.DataFrame(clean_stocks)
             
             # 重命名列
             column_names = {
@@ -534,11 +741,13 @@ class VolumeAnomalyWorkflow:
         # 统计信息
         avg_score = sum(s['anomaly_score'] for s in self.anomaly_stocks) / len(self.anomaly_stocks)
         max_score = max(s['anomaly_score'] for s in self.anomaly_stocks)
+        high_count = sum(1 for s in self.anomaly_stocks if s['is_historical_high'])
         
         logger.info(f"\n📈 统计信息:")
         logger.info(f"   平均异常评分: {avg_score:.1f}")
         logger.info(f"   最高异常评分: {max_score:.1f}")
-        logger.info(f"   创新高股票数: {sum(1 for s in self.anomaly_stocks if s['is_historical_high'])}只")
+        logger.info(f"   创新高股票数: {high_count}只")
+        logger.info(f"   图表保存目录: {self.chart_dir}")
 
 def main():
     """主函数"""
@@ -551,6 +760,11 @@ def main():
         # 测试时可以设置limit=100限制数量，正式运行时去掉limit参数
         workflow.detect_all_anomalies(limit=200)  # 测试200只活跃股票
         
+        # 生成图表
+        if workflow.anomaly_stocks:
+            chart_files = workflow.generate_all_charts()
+            logger.info(f"📊 图表文件已保存到: {workflow.chart_dir}")
+        
         # 打印摘要
         workflow.print_summary()
         
@@ -558,7 +772,10 @@ def main():
         filename = workflow.save_results()
         
         if filename:
-            logger.info(f"🎉 检测完成！结果已保存到: {filename}")
+            logger.info(f"🎉 检测完成！")
+            logger.info(f"📋 Excel结果: {filename}")
+            logger.info(f"📊 图表目录: {workflow.chart_dir}")
+            logger.info(f"💡 可以直接打开图表文件查看成交量走势")
         
     except KeyboardInterrupt:
         logger.info("用户中断程序")

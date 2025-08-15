@@ -1,301 +1,257 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-阈值突破成交量检测器
-使用你要的正确算法：前60天没有超过阈值，今天突破
+策略调试脚本 - 找出具体卡在哪个环节
 """
 
-import requests
-import re
-import json
-import time
-import random
 import logging
+import statistics
+from stock_utils import StockUtils
 
 # 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class ThresholdVolumeDetector:
+class StrategyDebugger:
     def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/javascript, */*;q=0.1',
-            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-            'Referer': 'http://quote.eastmoney.com/',
-        })
+        self.utils = StockUtils()
+        
+        # 使用你当前的参数
+        self.stable_days = 10
+        self.min_avg_volume = 0.8
+        self.max_cv = 2.8
+        self.today_volume_min_ratio = 1.1
+        self.today_volume_max_ratio = 10.0
+        self.today_change_min = 0.2
+        self.today_change_max = 30.0
+        self.recent_check_days = 20
+        self.max_similar_days = 3
+        self.min_price = 3.0
+        self.max_price = 150.0
+        
+        # 统计各个环节的过滤情况
+        self.stats = {
+            'total': 0,
+            'price_filter': 0,
+            'change_filter': 0, 
+            'volume_filter': 0,
+            'kline_data_fail': 0,
+            'stable_data_insufficient': 0,
+            'stable_avg_fail': 0,
+            'stable_cv_fail': 0,
+            'volume_ratio_fail': 0,
+            'first_volume_fail': 0,
+            'score_fail': 0,
+            'passed': 0
+        }
     
-    def _extract_jsonp_data(self, response_text):
-        """从JSONP响应中提取JSON数据"""
+    def debug_single_stock(self, stock_info, show_details=False):
+        """调试单只股票，记录在哪个环节被过滤"""
         try:
-            pattern = r'[a-zA-Z_$][a-zA-Z0-9_$]*\((.*)\)'
-            match = re.search(pattern, response_text)
-            if match:
-                json_str = match.group(1)
-                return json.loads(json_str)
-            return None
-        except Exception as e:
-            logger.error(f"解析JSONP数据失败: {str(e)}")
-            return None
-    
-    def test_stock_threshold(self, stock_code):
-        """测试单只股票的阈值突破"""
-        print(f"\n🔍 阈值突破分析: {stock_code}")
-        print("="*60)
-        
-        # 步骤1: 获取股票基本信息
-        print("📊 步骤1: 获取股票基本信息...")
-        stock_info = self.get_stock_basic_info(stock_code)
-        if not stock_info:
-            print("❌ 获取股票基本信息失败")
-            return
-        
-        print(f"✅ 股票信息: {stock_info['name']}({stock_info['code']})")
-        print(f"   当前价格: {stock_info['current_price']:.2f}元")
-        print(f"   涨跌幅: {stock_info['change_pct']:+.2f}%")
-        print(f"   今日成交量: {stock_info['today_volume']:.1f}万手")
-        print(f"   成交额: {stock_info['turnover']/100000000:.2f}亿元")
-        
-        # 步骤2: 获取历史K线数据
-        print("\n📈 步骤2: 获取历史K线数据...")
-        kline_data = self.get_stock_kline_data(stock_code, days=61)  # 60天历史+今天
-        
-        if not kline_data or len(kline_data) < 61:
-            print(f"❌ 获取K线数据失败或数据不足，只有{len(kline_data) if kline_data else 0}天")
-            return
-        
-        print(f"✅ 获取到 {len(kline_data)} 天的K线数据")
-        
-        # 步骤3: 阈值突破分析
-        print("\n🎯 步骤3: 阈值突破分析...")
-        
-        # 数据分离：前60天历史 + 今天
-        historical_60 = kline_data[:-1]  # 前60天
-        today_data = kline_data[-1]      # 今天
-        today_volume = today_data['volume']
-        
-        print(f"   历史基准: {historical_60[0]['date']} 到 {historical_60[-1]['date']} (60天)")
-        print(f"   今日数据: {today_data['date']} → {today_volume:.1f}万手")
-        print(f"   API数据: {stock_info['today_volume']:.1f}万手")
-        print(f"   数据一致性: {'✅' if abs(today_volume - stock_info['today_volume']) < 1 else '❌'}")
-        
-        # 设定阈值（基于今日成交量）
-        threshold_50 = today_volume * 0.5   # 50%阈值
-        threshold_60 = today_volume * 0.6   # 60%阈值
-        threshold_70 = today_volume * 0.7   # 70%阈值
-        
-        print(f"\n📊 阈值设定:")
-        print(f"   今日成交量: {today_volume:.1f}万手")
-        print(f"   50%阈值: {threshold_50:.1f}万手 (今日量÷2)")
-        print(f"   60%阈值: {threshold_60:.1f}万手")
-        print(f"   70%阈值: {threshold_70:.1f}万手")
-        
-        # 检查历史突破情况
-        over_50_days = []
-        over_60_days = []
-        over_70_days = []
-        
-        for day in historical_60:
-            if day['volume'] > threshold_50:
-                over_50_days.append(day)
-            if day['volume'] > threshold_60:
-                over_60_days.append(day)
-            if day['volume'] > threshold_70:
-                over_70_days.append(day)
-        
-        print(f"\n🔍 历史60天突破检查:")
-        print(f"   超过50%阈值的天数: {len(over_50_days)}天")
-        print(f"   超过60%阈值的天数: {len(over_60_days)}天")
-        print(f"   超过70%阈值的天数: {len(over_70_days)}天")
-        
-        # 显示超过阈值的具体日期
-        if over_50_days:
-            print(f"\n📅 超过50%阈值的日期:")
-            for day in over_50_days:
-                print(f"     {day['date']}: {day['volume']:.1f}万手")
-        
-        if over_70_days:
-            print(f"\n📅 超过70%阈值的日期:")
-            for day in over_70_days:
-                print(f"     {day['date']}: {day['volume']:.1f}万手")
-        
-        # 显示最近10天成交量详情
-        print(f"\n📊 最近10天成交量:")
-        recent_10 = historical_60[-10:]
-        for day in recent_10:
-            over_mark = ""
-            if day['volume'] > threshold_70:
-                over_mark = " 🔴🔴 (超70%)"
-            elif day['volume'] > threshold_50:
-                over_mark = " 🔴 (超50%)"
-            print(f"   {day['date']}: {day['volume']:.1f}万手{over_mark}")
-        print(f"   {today_data['date']}: {today_volume:.1f}万手 ← 今日突破")
-        
-        # 异常判断
-        is_breakthrough_50 = len(over_50_days) == 0
-        is_breakthrough_60 = len(over_60_days) == 0
-        is_breakthrough_70 = len(over_70_days) == 0
-        
-        # 严格模式：前60天完全没超过50%阈值
-        is_strict_anomaly = (
-            is_breakthrough_50 and
-            stock_info['change_pct'] > 0.5 and
-            today_volume > 10.0
-        )
-        
-        # 宽松模式：前60天最多1天超过60%阈值
-        is_loose_anomaly = (
-            len(over_60_days) <= 1 and
-            stock_info['change_pct'] > 0.3 and
-            today_volume > 5.0
-        )
-        
-        print(f"\n🚨 突破异常判断:")
-        print(f"   严格模式 (前60天无超50%阈值):")
-        print(f"     - 前60天无超50%: {'✅' if is_breakthrough_50 else '❌'} ({len(over_50_days)}天超过)")
-        print(f"     - 股价上涨≥0.5%: {'✅' if stock_info['change_pct'] > 0.5 else '❌'} ({stock_info['change_pct']:.2f}%)")
-        print(f"     - 成交量≥10万手: {'✅' if today_volume > 10.0 else '❌'} ({today_volume:.1f}万手)")
-        print(f"     - 严格结果: {'🚨 真正的突破异常！' if is_strict_anomaly else '❌ 不符合'}")
-        
-        print(f"\n   宽松模式 (前60天≤1天超60%阈值):")
-        print(f"     - 前60天≤1天超60%: {'✅' if len(over_60_days) <= 1 else '❌'} ({len(over_60_days)}天超过)")
-        print(f"     - 股价上涨≥0.3%: {'✅' if stock_info['change_pct'] > 0.3 else '❌'} ({stock_info['change_pct']:.2f}%)")
-        print(f"     - 成交量≥5万手: {'✅' if today_volume > 5.0 else '❌'} ({today_volume:.1f}万手)")
-        print(f"     - 宽松结果: {'🎯 潜在机会' if is_loose_anomaly else '❌ 不符合'}")
-        
-        # 最终结论
-        final_result = is_strict_anomaly or is_loose_anomaly
-        print(f"\n💡 最终结论: {'🚨 值得关注的异常放量' if final_result else '✅ 正常波动'}")
-        
-        if final_result:
-            anomaly_type = "严格突破" if is_strict_anomaly else "宽松突破"
-            historical_max = max(day['volume'] for day in historical_60)
-            print(f"\n📈 投资建议:")
-            print(f"   - 异常类型: {anomaly_type}")
-            print(f"   - 突破强度: 今日是阈值的{today_volume/threshold_50:.1f}倍")
-            print(f"   - 历史对比: {'创60天新高' if today_volume > historical_max else f'相对60天最高{today_volume/historical_max:.2f}倍'}")
-            print(f"   - 短线策略: 明日可重点关注，设置合理止损")
-            print(f"   - 风险提示: 验证是否有重大消息面支撑")
-        
-        return final_result
-    
-    def get_stock_basic_info(self, stock_code):
-        """获取股票基本信息"""
-        try:
-            # 搜索股票信息
-            for page in range(1, 6):  # 搜索前5页
-                timestamp = int(time.time() * 1000)
-                callback = f"jQuery{random.randint(10**20, 10**21-1)}_{timestamp}"
-                
-                url = "https://push2.eastmoney.com/api/qt/clist/get"
-                params = {
-                    'np': '1',
-                    'fltt': '1',
-                    'invt': '2',
-                    'cb': callback,
-                    'fs': 'm:1+t:2,m:1+t:23',
-                    'fields': 'f12,f13,f14,f1,f2,f4,f3,f152,f5,f6,f7,f15,f18,f16,f17,f10,f8,f9,f23',
-                    'fid': 'f3',
-                    'pn': str(page),
-                    'pz': '50',
-                    'po': '1',
-                    'dect': '1',
-                    'ut': 'fa5fd1943c7b386f172d6893dbfba10b',
-                    '_': str(timestamp + random.randint(1, 100))
-                }
-                
-                response = self.session.get(url, params=params, timeout=15)
-                if response.status_code == 200:
-                    data = self._extract_jsonp_data(response.text)
-                    if data and data.get('rc') == 0:
-                        stocks = data.get('data', {}).get('diff', [])
-                        
-                        for stock in stocks:
-                            if stock.get('f12') == stock_code:
-                                return {
-                                    'code': stock.get('f12', ''),
-                                    'name': stock.get('f14', ''),
-                                    'current_price': stock.get('f2', 0) / 100 if stock.get('f2') else 0,
-                                    'change_pct': stock.get('f3', 0) / 100 if stock.get('f3') else 0,
-                                    'today_volume': stock.get('f5', 0) / 100,
-                                    'turnover': stock.get('f6', 0)
-                                }
-                
-                time.sleep(0.1)
+            self.stats['total'] += 1
+            stock_code = stock_info['code']
+            stock_name = stock_info['name']
             
-            return None
+            if show_details:
+                print(f"\n🔍 调试: {stock_name}({stock_code})")
             
-        except Exception as e:
-            print(f"❌ 获取股票基本信息异常: {str(e)}")
-            return None
-    
-    def get_stock_kline_data(self, stock_code, days=61):
-        """获取K线数据"""
-        try:
-            timestamp = int(time.time() * 1000)
-            callback = f"jQuery{random.randint(10**20, 10**21-1)}_{timestamp}"
+            # 基础过滤
+            if not (self.min_price <= stock_info['current_price'] <= self.max_price):
+                self.stats['price_filter'] += 1
+                if show_details: print(f"   ❌ 价格过滤: {stock_info['current_price']:.2f}")
+                return None, "price_filter"
             
-            url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-            params = {
-                'fields1': 'f1,f2,f3,f4,f5',
-                'fields2': 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61',
-                'fqt': '1',
-                'end': '29991010',
-                'ut': 'fa5fd1943c7b386f172d6893dbfba10b',
-                'cb': callback,
-                'klt': '101',
-                'secid': f'1.{stock_code}',
-                'lmt': str(days),
-                '_': str(timestamp + random.randint(1, 100))
+            if not (self.today_change_min <= stock_info['change_pct'] <= self.today_change_max):
+                self.stats['change_filter'] += 1
+                if show_details: print(f"   ❌ 涨幅过滤: {stock_info['change_pct']:.2f}%")
+                return None, "change_filter"
+            
+            if stock_info['today_volume'] < self.min_avg_volume:
+                self.stats['volume_filter'] += 1
+                if show_details: print(f"   ❌ 成交量过滤: {stock_info['today_volume']:.1f}")
+                return None, "volume_filter"
+            
+            # 获取历史数据
+            kline_data = self.utils.get_stock_kline_data(stock_code, days=35)
+            if len(kline_data) < 32:
+                self.stats['kline_data_fail'] += 1
+                if show_details: print(f"   ❌ 历史数据不足: {len(kline_data)}天")
+                return None, "kline_data_fail"
+            
+            # 数据分析
+            recent_period = kline_data[-(self.recent_check_days+1):-1]
+            stable_period = kline_data[-(self.stable_days+self.recent_check_days+1):-(self.recent_check_days+1)]
+            
+            if len(stable_period) < self.stable_days or len(recent_period) < self.recent_check_days:
+                self.stats['stable_data_insufficient'] += 1
+                if show_details: print(f"   ❌ 稳定期数据不足")
+                return None, "stable_data_insufficient"
+            
+            # 稳定期分析
+            stable_volumes = [d['volume'] for d in stable_period if d['volume'] > 0]
+            if len(stable_volumes) < 5:
+                self.stats['stable_data_insufficient'] += 1
+                if show_details: print(f"   ❌ 有效稳定期数据不足")
+                return None, "stable_data_insufficient"
+            
+            stable_avg = statistics.mean(stable_volumes)
+            stable_std = statistics.stdev(stable_volumes) if len(stable_volumes) > 1 else 0
+            stable_cv = stable_std / stable_avg if stable_avg > 0 else float('inf')
+            
+            if stable_avg < self.min_avg_volume:
+                self.stats['stable_avg_fail'] += 1
+                if show_details: print(f"   ❌ 稳定期均量不足: {stable_avg:.1f}")
+                return None, "stable_avg_fail"
+            
+            if stable_cv > self.max_cv:
+                self.stats['stable_cv_fail'] += 1
+                if show_details: print(f"   ❌ 变异系数过大: {stable_cv:.3f}")
+                return None, "stable_cv_fail"
+            
+            # 今日放量检查
+            today_volume = stock_info['today_volume']
+            today_volume_ratio = today_volume / stable_avg if stable_avg > 0 else 0
+            
+            if not (self.today_volume_min_ratio <= today_volume_ratio <= self.today_volume_max_ratio):
+                self.stats['volume_ratio_fail'] += 1
+                if show_details: print(f"   ❌ 放量倍数不符: {today_volume_ratio:.2f}x")
+                return None, "volume_ratio_fail"
+            
+            # 首次放量检查
+            similar_volume_days = 0
+            for day in recent_period:
+                day_ratio = day['volume'] / stable_avg if stable_avg > 0 else 0
+                if day_ratio >= today_volume_ratio * 0.7:
+                    similar_volume_days += 1
+            
+            if similar_volume_days > self.max_similar_days:
+                self.stats['first_volume_fail'] += 1
+                if show_details: print(f"   ❌ 不是首次放量: {similar_volume_days}次")
+                return None, "first_volume_fail"
+            
+            # 评分计算
+            stability_score = max(0, 40 - stable_cv * 15)  # 放宽评分
+            first_score = 30 - similar_volume_days * 8
+            volume_score = 20 if 1.1 <= today_volume_ratio <= 3.0 else 15
+            change_score = 10 if 1.0 <= stock_info['change_pct'] <= 8.0 else 7
+            
+            total_score = stability_score + first_score + volume_score + change_score
+            
+            # 大幅降低评分阈值
+            if total_score < 30:  # 从50降到30
+                self.stats['score_fail'] += 1
+                if show_details: print(f"   ❌ 评分不足: {total_score:.1f}")
+                return None, "score_fail"
+            
+            # 通过所有检查
+            self.stats['passed'] += 1
+            result = {
+                'code': stock_code,
+                'name': stock_name,
+                'current_price': stock_info['current_price'],
+                'today_change': stock_info['change_pct'],
+                'today_volume': today_volume,
+                'today_volume_ratio': today_volume_ratio,
+                'stable_avg_volume': stable_avg,
+                'stable_cv': stable_cv,
+                'similar_volume_days': similar_volume_days,
+                'quality_score': total_score
             }
             
-            response = self.session.get(url, params=params, timeout=15)
-            if response.status_code == 200:
-                data = self._extract_jsonp_data(response.text)
-                if data and data.get('rc') == 0:
-                    klines = data.get('data', {}).get('klines', [])
-                    
-                    parsed_data = []
-                    for kline in klines:
-                        parts = kline.split(',')
-                        if len(parts) >= 6:
-                            try:
-                                date = parts[0]
-                                volume = float(parts[5]) / 100  # 转换为万手
-                                parsed_data.append({
-                                    'date': date,
-                                    'volume': volume
-                                })
-                            except (ValueError, IndexError):
-                                continue
-                    
-                    return parsed_data
-            
-            return []
+            if show_details: print(f"   ✅ 通过检查: 评分{total_score:.1f}")
+            return result, "passed"
             
         except Exception as e:
-            print(f"❌ 获取K线数据异常: {str(e)}")
-            return []
+            if show_details: print(f"   ❌ 分析异常: {str(e)}")
+            return None, "exception"
+    
+    def debug_market(self, limit=100):
+        """调试整个市场，找出过滤的分布情况"""
+        print("🔍 开始市场调试分析...")
+        
+        # 获取股票列表
+        all_stocks = self.utils.get_shanghai_a_stocks()
+        if not all_stocks:
+            print("❌ 无法获取股票列表")
+            return
+        
+        # 预筛选（使用最基础的条件）
+        basic_filter_stocks = []
+        for stock in all_stocks:
+            if (self.min_price <= stock.get('current_price', 0) <= self.max_price and
+                self.today_change_min <= stock.get('change_pct', 0) <= self.today_change_max and
+                stock.get('today_volume', 0) >= self.min_avg_volume):
+                basic_filter_stocks.append(stock)
+        
+        print(f"📊 基础筛选: {len(all_stocks)} → {len(basic_filter_stocks)} 只股票")
+        
+        # 按成交量排序，优先分析活跃股票
+        basic_filter_stocks.sort(key=lambda x: x.get('today_volume', 0), reverse=True)
+        
+        if limit:
+            test_stocks = basic_filter_stocks[:limit]
+            print(f"🎯 测试前 {limit} 只活跃股票")
+        else:
+            test_stocks = basic_filter_stocks
+        
+        passed_stocks = []
+        
+        # 调试分析
+        for i, stock in enumerate(test_stocks, 1):
+            if i <= 5:  # 前5只显示详情
+                result, reason = self.debug_single_stock(stock, show_details=True)
+            else:
+                result, reason = self.debug_single_stock(stock, show_details=False)
+            
+            if result:
+                passed_stocks.append(result)
+                print(f"🎯 发现符合条件: {result['name']}({result['code']}) - 评分{result['quality_score']:.1f}")
+            
+            if i % 20 == 0:
+                print(f"   进度: {i}/{len(test_stocks)} ({i/len(test_stocks)*100:.1f}%)")
+        
+        # 输出统计结果
+        print(f"\n📊 过滤统计结果:")
+        print(f"   总股票数: {self.stats['total']}")
+        print(f"   价格过滤: {self.stats['price_filter']} ({self.stats['price_filter']/self.stats['total']*100:.1f}%)")
+        print(f"   涨幅过滤: {self.stats['change_filter']} ({self.stats['change_filter']/self.stats['total']*100:.1f}%)")
+        print(f"   成交量过滤: {self.stats['volume_filter']} ({self.stats['volume_filter']/self.stats['total']*100:.1f}%)")
+        print(f"   历史数据不足: {self.stats['kline_data_fail']} ({self.stats['kline_data_fail']/self.stats['total']*100:.1f}%)")
+        print(f"   稳定期数据不足: {self.stats['stable_data_insufficient']} ({self.stats['stable_data_insufficient']/self.stats['total']*100:.1f}%)")
+        print(f"   稳定期均量不足: {self.stats['stable_avg_fail']} ({self.stats['stable_avg_fail']/self.stats['total']*100:.1f}%)")
+        print(f"   变异系数过大: {self.stats['stable_cv_fail']} ({self.stats['stable_cv_fail']/self.stats['total']*100:.1f}%)")
+        print(f"   放量倍数不符: {self.stats['volume_ratio_fail']} ({self.stats['volume_ratio_fail']/self.stats['total']*100:.1f}%)")
+        print(f"   不是首次放量: {self.stats['first_volume_fail']} ({self.stats['first_volume_fail']/self.stats['total']*100:.1f}%)")
+        print(f"   评分不足: {self.stats['score_fail']} ({self.stats['score_fail']/self.stats['total']*100:.1f}%)")
+        print(f"   ✅ 通过检查: {self.stats['passed']} ({self.stats['passed']/self.stats['total']*100:.1f}%)")
+        
+        if passed_stocks:
+            print(f"\n🎯 发现 {len(passed_stocks)} 只符合条件的股票:")
+            for stock in passed_stocks:
+                print(f"   {stock['name']}({stock['code']}) - 评分{stock['quality_score']:.1f}")
+        else:
+            print(f"\n💡 建议调整策略:")
+            # 找出最大的过滤器
+            max_filter = max(self.stats.items(), key=lambda x: x[1] if x[0] != 'total' and x[0] != 'passed' else 0)
+            print(f"   最大瓶颈: {max_filter[0]} 过滤了 {max_filter[1]} 只股票")
+            
+            if max_filter[0] == 'stable_cv_fail':
+                print(f"   建议: 进一步放宽变异系数到 5.0 或更大")
+            elif max_filter[0] == 'volume_ratio_fail':
+                print(f"   建议: 进一步放宽放量倍数范围，如 1.05 - 20.0")
+            elif max_filter[0] == 'first_volume_fail':
+                print(f"   建议: 放宽首次放量要求到 10 次")
+            elif max_filter[0] == 'score_fail':
+                print(f"   建议: 降低评分阈值到 20 分")
 
 def main():
-    """主函数"""
-    detector = ThresholdVolumeDetector()
+    debugger = StrategyDebugger()
     
-    print("🔍 阈值突破成交量检测工具")
+    print("🔧 策略调试工具 - 找出过滤瓶颈")
     print("="*60)
     
-    # 测试华胜天成
-    print("\n🔬 测试华胜天成(600410) - 应该不是异常")
-    detector.test_stock_threshold("600410")
-    
-    # 测试东吴证券
-    print("\n" + "="*80)
-    print("🔬 测试东吴证券(601555) - 应该是异常")
-    detector.test_stock_threshold("601555")
+    # 调试分析
+    debugger.debug_market(limit=200)  # 测试200只活跃股票
 
 if __name__ == "__main__":
     main()
